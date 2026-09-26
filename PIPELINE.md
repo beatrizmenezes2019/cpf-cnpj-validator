@@ -237,9 +237,52 @@ Numa das execuções, o Trivy bloqueou o job `build` com 19 CVEs `HIGH` — não
 no código do `docval`, mas na própria *standard library* do Go embutida no
 binário (`net/url`, `crypto/x509`, `crypto/tls`, etc.), porque o
 `Dockerfile` compilava com a última patch da série Go 1.24 (1.24.13), que
-já não recebe mais backports de segurança. A correção foi trocar a versão
-do Go usada no build (`go.mod` e `Dockerfile`) para 1.26.6+, onde essas
-CVEs já estão corrigidas — reforçando por que o scanner de vulnerabilidade
-roda **depois** do build e **antes** de qualquer deploy: ele barra não só
-falhas no código escrito pela equipe, mas também dependências e toolchains
-desatualizados.
+já não recebe mais backports de segurança. As correções só existem a
+partir de 1.25.13 ou 1.26.6, o que reforça por que o scanner de
+vulnerabilidade roda **depois** do build e **antes** de qualquer deploy:
+ele barra não só falhas no código escrito pela equipe, mas também
+dependências e toolchains desatualizados.
+
+A primeira tentativa de correção foi simplesmente subir a versão declarada
+em `go.mod` para `go 1.26.6` — isso resolveu o Trivy, mas quebrou o job
+`static-analysis` logo em seguida, com um erro diferente:
+
+```
+Error: can't load config: the Go language version (go1.25) used to build
+golangci-lint is lower than the targeted Go version (1.26.6)
+```
+
+O `golangci-lint` (versão 2.5.0, usada no pipeline) foi ele mesmo compilado
+com Go ~1.25.x, e se recusa a analisar um módulo que declare, em `go.mod`,
+uma versão de Go **maior** que a sua própria versão de build. Ou seja, a
+mesma diretiva `go` em `go.mod` estava sendo lida por duas ferramentas com
+exigências opostas: o Trivy queria a stdlib mais nova possível (embutida no
+binário final), e o golangci-lint queria uma versão baixa o bastante para
+conseguir processar o código.
+
+A solução foi **desacoplar as duas coisas**, já que a diretiva `go` em
+`go.mod` é apenas uma versão MÍNIMA exigida (não trava qual toolchain
+realmente compila o binário):
+
+- `go.mod` voltou a declarar `go 1.24.7` — baixo o suficiente para o
+  golangci-lint aceitar, servindo apenas de piso de compatibilidade para
+  as ferramentas de análise estática.
+- O `Dockerfile` continua usando a imagem `golang:1.26-alpine` (tag
+  flutuante, sempre resolve para a última patch 1.26.x publicada) —
+  garante a stdlib patchada no binário compilado localmente/no build da
+  imagem.
+- O job `build` do pipeline passou a fixar explicitamente
+  `go-version: "1.26.6"` no passo `actions/setup-go`, em vez de ler
+  `go-version-file: go.mod` como os demais jobs — assim os binários
+  publicados (multiplataforma e a imagem Docker) sempre usam o toolchain
+  patchado, independentemente do que `go.mod` declara.
+- Os jobs `static-analysis` e `test` continuam lendo `go-version-file:
+  go.mod` normalmente (1.24.7), já que não distribuem artefatos — só
+  precisam compilar o suficiente para rodar os linters e os testes.
+
+Essa separação — "versão mínima declarada" (compatibilidade de
+ferramentas) vs. "versão de toolchain usada para os artefatos finais"
+(segurança/CVEs) — é uma consequência direta de como o Go trata a diretiva
+`go` em `go.mod`: ela nunca *proíbe* compilar com uma versão mais nova, só
+declara o piso exigido; por isso é seguro mantê-la baixa em `go.mod` e
+ainda assim publicar binários compilados com uma versão bem mais recente.

@@ -5,10 +5,18 @@
 # compilado com a última patch da série 1.24 (1.24.13) — essa série mais
 # antiga não recebe mais os backports de segurança. As correções só
 # existem a partir de 1.25.13 ou 1.26.6. Usamos a tag flutuante "1.26"
-# (sempre resolve para a última patch publicada) como piso; o `go.mod`
-# declara "go 1.26.6" como versão mínima exigida — se a imagem trouxer
-# algo um pouco mais antigo, o próprio Go baixa o patch exato sozinho
-# (GOTOOLCHAIN=auto, o padrão desde o Go 1.21).
+# (sempre resolve para a última patch publicada), que garante um Go
+# patchado neste build local via Docker.
+#
+# Importante: o `go.mod` deste projeto declara "go 1.24.7" (uma versão
+# MÍNIMA baixa de propósito), não "1.26.6" — isso é exigido pelo
+# golangci-lint, que recusa analisar um módulo cuja versão declarada
+# seja maior que a versão com que ele próprio foi compilado (veja o
+# job "static-analysis" em ci-cd.yml). Por isso, aqui na imagem Docker
+# e no job "build" do pipeline (que fixa `go-version: "1.26.6"`
+# explicitamente em vez de ler go.mod), a versão do toolchain é
+# definida de forma independente do `go.mod`, garantindo a stdlib
+# patchada nos binários finais sem exigir isso da ferramenta de lint.
 FROM golang:1.26-alpine AS builder
 
 WORKDIR /src

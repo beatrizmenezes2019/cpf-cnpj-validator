@@ -48,6 +48,16 @@ jobs:
       - name: Checkout do código
         uses: actions/checkout@v4
 
+      # Usa a versão MÍNIMA declarada em go.mod (1.24.7) de propósito.
+      # O go.mod é mantido baixo aqui porque o golangci-lint 2.5.0 (ver
+      # comentário abaixo) foi ele mesmo compilado com Go 1.25.x e recusa
+      # analisar um módulo cujo `go.mod` declare uma versão MAIOR que a
+      # sua própria versão de build ("the Go language version used to
+      # build golangci-lint is lower than the targeted Go version").
+      # Isso é só uma restrição da FERRAMENTA de lint — não afeta o
+      # toolchain usado para compilar os binários de fato distribuídos;
+      # esse, o job "build" fixa explicitamente em 1.26.6 (patchado
+      # contra as CVEs da stdlib — veja o Dockerfile e o PIPELINE.md).
       - name: Configurar Go
         uses: actions/setup-go@v5
         with:
@@ -70,6 +80,11 @@ jobs:
       # a v6 da action instala por padrão o golangci-lint 1.x, cujo
       # schema de configuração é incompatível com o .golangci.yml
       # (formato v2, com a chave "version: 2" no topo do arquivo).
+      #
+      # Além disso, o binário do golangci-lint 2.5.0 foi compilado com
+      # Go ~1.25.x — por isso o go.mod deste projeto declara "go 1.24.7"
+      # (abaixo dessa versão), em vez de "1.26.6". Ver comentário acima,
+      # no passo "Configurar Go".
       - name: golangci-lint (SAST — múltiplos linters agregados)
         uses: golangci/golangci-lint-action@v7
         with:
@@ -155,10 +170,18 @@ jobs:
       - name: Checkout do código
         uses: actions/checkout@v4
 
-      - name: Configurar Go
+      # Pinado explicitamente em 1.26.6 (não em go-version-file: go.mod):
+      # o go.mod declara "1.24.7" de propósito, para ficar compatível com
+      # o golangci-lint (que não analisa módulos que declaram uma versão
+      # maior que a que ele próprio foi compilado — veja o job
+      # static-analysis). Mas os BINÁRIOS distribuídos aqui precisam da
+      # stdlib patchada (as 19 CVEs corrigidas em 1.25.13/1.26.6 — veja
+      # PIPELINE.md), então essa etapa usa a versão exata do toolchain,
+      # independente do que o go.mod declara.
+      - name: Configurar Go (versão patchada, para o build dos binários)
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: "1.26.6"
 
       # A versão embutida no binário identifica de onde ele veio:
       #   develop        -> dev-<sha curto>
