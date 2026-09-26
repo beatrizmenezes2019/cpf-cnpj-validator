@@ -1,0 +1,73 @@
+# Automação 1/2: feature/** -> PR automático para develop
+#
+# Ao dar push em qualquer branch "feature/*" (criada a partir de develop),
+# abre automaticamente um Pull Request dessa branch para develop, se ainda
+# não existir um. Isso faz o job "pull_request" do ci-cd.yml (verificação
+# estática + dinâmica + build) rodar automaticamente sobre a feature.
+#
+# Requer o secret GH_PAT (ver README/PIPELINE.md — "Configuração da
+# automação"): sem ele, o PR é aberto com o GITHUB_TOKEN padrão e o
+# ci-cd.yml NÃO dispara sobre o PR criado (proteção anti-loop do
+# GitHub Actions para eventos gerados pelo próprio GITHUB_TOKEN).
+name: Auto PR - Feature para Develop
+
+on:
+  push:
+    branches:
+      - "feature/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  abrir-pr:
+    name: Abrir PR automático (feature -> develop)
+    runs-on: ubuntu-latest
+    # github.event.deleted é true quando o push é uma exclusão de branch
+    # (ex.: `git push origin --delete feature/x`) — nada a fazer nesse caso.
+    if: github.event.deleted == false
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Garantir referências locais de develop e da feature
+        run: |
+          git fetch origin develop:refs/remotes/origin/develop
+          git fetch origin "${{ github.ref_name }}:refs/remotes/origin/${{ github.ref_name }}" || true
+
+      - name: Criar PR para develop (se ainda não existir)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Secret GH_PAT não configurado. Veja PIPELINE.md > Configuração da automação."
+            exit 1
+          fi
+
+          # Nada a abrir se não há nenhum commit novo em relação a develop.
+          COMMITS_NOVOS=$(git rev-list --count "origin/develop..origin/${BRANCH}" || echo 0)
+          if [ "$COMMITS_NOVOS" -eq 0 ]; then
+            echo "Nenhum commit novo em '$BRANCH' em relação a develop. Nada a fazer."
+            exit 0
+          fi
+
+          PR_EXISTENTE=$(gh pr list --base develop --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$PR_EXISTENTE" ]; then
+            echo "PR #$PR_EXISTENTE já existe para '$BRANCH' -> develop. Nada a fazer."
+            exit 0
+          fi
+
+          CORPO="Pull Request aberto automaticamente ao detectar push em \`$BRANCH\`.
+
+          Assim que aprovado e mergeado em \`develop\`, uma branch \`release/X.X.X\` é criada automaticamente e um novo PR para \`main\` é aberto."
+
+          gh pr create \
+            --base develop \
+            --head "$BRANCH" \
+            --title "feat: ${BRANCH#feature/}" \
+            --body "$CORPO"

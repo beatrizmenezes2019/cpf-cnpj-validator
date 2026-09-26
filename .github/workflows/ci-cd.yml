@@ -1,0 +1,369 @@
+# Pipeline de CI/CD do docval.
+#
+# Mecânica de 3 ambientes por branch (GitFlow simplificado):
+#   develop        -> ambiente "development"   (integração contínua)
+#   release/X.X.X  -> ambiente "homologacao"    (validação pré-produção)
+#   main           -> ambiente "production"     (produção)
+#
+# Segue o fio condutor apresentado em aula (Código-fonte -> Artefato
+# imutável -> Validação dinâmica -> Deploy técnico -> Validação de carga),
+# com dois eixos: Garantia de Qualidade (verificação estática + dinâmica)
+# e Capacidade de Entrega (build único, promovido entre ambientes via
+# GitHub Actions Environments).
+name: CI/CD Pipeline - docval
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - "release/**"
+  pull_request:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Estágio 1 — Verificação estática (SAST): roda em segundos, é o
+  # feedback mais barato do pipeline (princípio de Shift-Left). Roda em
+  # qualquer push ou PR para develop/main/release, sem exceção.
+  # ---------------------------------------------------------------------
+  static-analysis:
+    name: "1. Verificação estática (lint, vet, segredos)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt (formatação padrão)
+        run: |
+          faltando="$(gofmt -l .)"
+          if [ -n "$faltando" ]; then
+            echo "Os arquivos abaixo não estão formatados com gofmt:"
+            echo "$faltando"
+            exit 1
+          fi
+
+      - name: go vet (análise estática nativa)
+        run: go vet ./...
+
+      - name: golangci-lint (SAST — múltiplos linters agregados)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: Gitleaks (varredura de segredos/credenciais no código)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # CodeQL é a ferramenta de SAST nativa do GitHub Actions: roda em job
+  # próprio porque tem um modelo de execução diferente (init/autobuild/analyze).
+  codeql:
+    name: "1b. CodeQL (SAST nativo do GitHub)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analisar
+        uses: github/codeql-action/analyze@v3
+
+  # ---------------------------------------------------------------------
+  # Estágio 2 — Verificação dinâmica: executa o programa de fato (testes
+  # unitários com race detector) e aplica um quality gate de cobertura.
+  # ---------------------------------------------------------------------
+  test:
+    name: "2. Testes dinâmicos (unitários + cobertura)"
+    runs-on: ubuntu-latest
+    needs: [static-analysis]
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Testes com detector de race conditions
+        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic -v
+
+      - name: Quality gate — cobertura mínima de 80%
+        run: |
+          total=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | tr -d '%')
+          echo "Cobertura total: ${total}%"
+          awk -v t="$total" 'BEGIN { if (t + 0 < 80) { print "Cobertura abaixo do mínimo de 80%"; exit 1 } }'
+
+      - name: Publicar relatório de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+
+  # ---------------------------------------------------------------------
+  # Estágio 3 — Build: gera o artefato imutável (binários) e a imagem de
+  # contêiner, e faz a varredura de vulnerabilidades (CVE scanner) antes
+  # de publicar no registry. Esse MESMO artefato (tag = SHA do commit) é
+  # o que será promovido para development, homologação ou produção — o
+  # pipeline nunca recompila entre ambientes.
+  # ---------------------------------------------------------------------
+  build:
+    name: "3. Build multiplataforma + imagem de contêiner"
+    runs-on: ubuntu-latest
+    needs: [test, codeql]
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      version: ${{ steps.vars.outputs.version }}
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A versão embutida no binário identifica de onde ele veio:
+      #   develop        -> dev-<sha curto>
+      #   release/X.X.X  -> X.X.X (extraído do nome da branch)
+      #   main            -> X.X.X (recuperado da mensagem do merge que
+      #                      trouxe a release/X.X.X; stable-<sha> se não
+      #                      encontrar, ex.: hotfix direto em main)
+      #   qualquer PR     -> pr-<sha curto> (nunca é implantado)
+      - name: Definir versão e tag da imagem
+        id: vars
+        run: |
+          REF_NAME="${{ github.ref_name }}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            VERSAO_DA_RELEASE=$(git log -1 --pretty=%B | grep -oE 'release/[0-9]+\.[0-9]+\.[0-9]+' | sed 's#release/##' | head -1)
+            if [ -n "$VERSAO_DA_RELEASE" ]; then
+              echo "version=${VERSAO_DA_RELEASE}" >> "$GITHUB_OUTPUT"
+            else
+              echo "version=stable-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            fi
+          elif [[ "$REF_NAME" == release/* ]]; then
+            echo "version=${REF_NAME#release/}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=pr-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build dos binários (linux, windows, macOS / amd64, arm64)
+        run: |
+          mkdir -p dist
+          VERSION="${{ steps.vars.outputs.version }}"
+          for os in linux windows darwin; do
+            for arch in amd64 arm64; do
+              ext=""
+              [ "$os" = "windows" ] && ext=".exe"
+              echo "Compilando docval para ${os}/${arch}..."
+              GOOS="$os" GOARCH="$arch" go build \
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "dist/docval-${os}-${arch}${ext}" ./cmd/docval
+            done
+          done
+          ls -la dist/
+
+      - name: Publicar binários como artefato do pipeline
+        uses: actions/upload-artifact@v4
+        with:
+          name: docval-binaries
+          path: dist/
+
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Em Pull Requests a imagem é apenas construída e escaneada
+      # localmente (load), sem publicar no registry: só push direto em
+      # develop/release/main avança para os estágios de deploy.
+      - name: Build & push da imagem (tag = commit SHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scanner de vulnerabilidades da imagem (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          format: table
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+
+  # ---------------------------------------------------------------------
+  # Estágio 4a — Deploy em Development: todo push na branch `develop`.
+  # É o ambiente de integração contínua entre desenvolvedores.
+  # ---------------------------------------------------------------------
+  deploy-development:
+    name: "4a. Deploy em Development"
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: development
+      url: https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}
+    steps:
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promover imagem para a tag :dev
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          docker tag  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }} \
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
+
+      - name: Baixar binários publicados no estágio de build
+        uses: actions/download-artifact@v4
+        with:
+          name: docval-binaries
+          path: dist
+
+      - name: Smoke test dinâmico do binário em development
+        run: |
+          chmod +x dist/docval-linux-amd64
+          ./dist/docval-linux-amd64 version
+          ./dist/docval-linux-amd64 cpf validar 111.444.777-35
+          echo "Smoke test em development concluído com sucesso."
+
+  # ---------------------------------------------------------------------
+  # Estágio 4b — Deploy em Homologação: toda branch `release/X.X.X`.
+  # Ambiente de validação pré-produção, sob condições próximas do real,
+  # antes de expor a versão candidata aos usuários finais.
+  # ---------------------------------------------------------------------
+  deploy-homologacao:
+    name: "4b. Deploy em Homologação"
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: startsWith(github.ref, 'refs/heads/release/')
+    environment:
+      name: homologacao
+      url: https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}
+    steps:
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promover imagem para a tag :homolog-<versão>
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          docker tag  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }} \
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:homolog-${{ needs.build.outputs.version }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:homolog-${{ needs.build.outputs.version }}
+
+      - name: Baixar binários publicados no estágio de build
+        uses: actions/download-artifact@v4
+        with:
+          name: docval-binaries
+          path: dist
+
+      - name: Smoke test dinâmico do binário em homologação
+        run: |
+          chmod +x dist/docval-linux-amd64
+          ./dist/docval-linux-amd64 version
+          ./dist/docval-linux-amd64 cpf validar 111.444.777-35
+
+          # também confirma que um CPF inválido é corretamente rejeitado
+          if ./dist/docval-linux-amd64 cpf validar 111.444.777-36; then
+            echo "ERRO: deveria ter rejeitado um CPF com dígito verificador inválido"
+            exit 1
+          fi
+          echo "Smoke test em homologação concluído com sucesso."
+
+  # ---------------------------------------------------------------------
+  # Estágio 4c — Deploy em Produção: todo push na branch `main` (via
+  # merge de release/X.X.X aprovada em homologação). Pode (e deve) exigir
+  # aprovação manual configurada no ambiente "production" (Settings >
+  # Environments > production > Required reviewers).
+  # ---------------------------------------------------------------------
+  deploy-production:
+    name: "4c. Deploy em Produção"
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}
+    steps:
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promover imagem para produção (:latest e :<versão estável>)
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          docker tag  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }} \
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker tag  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }} \
+                      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}
+
+      - name: Baixar binários publicados no estágio de build
+        uses: actions/download-artifact@v4
+        with:
+          name: docval-binaries
+          path: dist
+
+      - name: Criar Release no GitHub com os binários (rollback = reverter a tag)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          files: dist/*
+          generate_release_notes: true

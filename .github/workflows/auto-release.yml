@@ -1,0 +1,86 @@
+# Automação 2/2: PR mergeado em develop -> cria release/X.X.X -> PR para main
+#
+# Quando um Pull Request é mergeado em develop, cria automaticamente uma
+# branch "release/X.X.X" (versão = patch seguinte à última release/X.X.X
+# existente, ou 0.1.0 se não houver nenhuma) e abre um Pull Request dela
+# para main. O push em "release/**" já dispara o deploy em homologação
+# no ci-cd.yml; o merge do PR aqui aberto em main dispara o deploy em
+# produção.
+#
+# Requer o secret GH_PAT pelo mesmo motivo do auto-pr-feature.yml: com o
+# GITHUB_TOKEN padrão, nem o push da branch release/X.X.X nem o PR aberto
+# aqui disparariam o ci-cd.yml.
+name: Auto Release - Develop para Main
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - develop
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  criar-release:
+    name: Criar branch de release e abrir PR (release -> main)
+    runs-on: ubuntu-latest
+    # types: [closed] dispara tanto para PR mergeado quanto para PR só
+    # fechado sem merge — só seguimos adiante no primeiro caso.
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Checkout de develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Calcular a próxima versão (semver, bump de patch)
+        id: versao
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::Secret GH_PAT não configurado. Veja PIPELINE.md > Configuração da automação."
+            exit 1
+          fi
+
+          git fetch origin 'refs/heads/release/*:refs/remotes/origin/release/*' --quiet || true
+
+          ULTIMA=$(git branch -r \
+            | grep -oE 'origin/release/[0-9]+\.[0-9]+\.[0-9]+' \
+            | sed 's#origin/release/##' \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -1)
+
+          if [ -z "$ULTIMA" ]; then
+            NOVA="0.1.0"
+          else
+            IFS='.' read -r MA MI PA <<< "$ULTIMA"
+            NOVA="${MA}.${MI}.$((PA + 1))"
+          fi
+
+          echo "Última versão de release encontrada: ${ULTIMA:-nenhuma}"
+          echo "Nova versão: $NOVA"
+          echo "versao=$NOVA" >> "$GITHUB_OUTPUT"
+
+      - name: Criar branch release/<versão> a partir de develop
+        run: |
+          git checkout -b "release/${{ steps.versao.outputs.versao }}"
+          git push origin "release/${{ steps.versao.outputs.versao }}"
+
+      - name: Abrir PR release/<versão> -> main
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          CORPO="Pull Request de homologação aberto automaticamente após o merge do PR #${{ github.event.pull_request.number }} em \`develop\`.
+
+          A branch \`release/${{ steps.versao.outputs.versao }}\` já está publicada e o deploy em **homologação** foi disparado pelo \`ci-cd.yml\`. Após validar, faça o merge deste PR para liberar em **produção**."
+
+          gh pr create \
+            --base main \
+            --head "release/${{ steps.versao.outputs.versao }}" \
+            --title "release: v${{ steps.versao.outputs.versao }}" \
+            --body "$CORPO"

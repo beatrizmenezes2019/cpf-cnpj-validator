@@ -1,9 +1,12 @@
 # docval
 
+[![CI/CD Pipeline](https://github.com/beatrizmenezes2019/cpf-cnpj-validator/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/beatrizmenezes2019/cpf-cnpj-validator/actions/workflows/ci-cd.yml)
+
 CLI em Go para validar, formatar e gerar números de CPF.
 
 Feita para a disciplina de Implantação e Entrega de Software (Engenharia de
-Software - UFG), como base para uma futura pipeline de CI/CD.
+Software - UFG). Ver [`PIPELINE.md`](PIPELINE.md) para os detalhes da
+pipeline de CI/CD com GitHub Actions.
 
 ## Uso
 
@@ -29,8 +32,13 @@ go build -o docval ./cmd/docval
 ## Estrutura
 
 ```
-cmd/docval/       ponto de entrada da CLI (main.go)
-internal/cpf/     lógica de validação, formatação e geração de CPF
+cmd/docval/                          ponto de entrada da CLI (main.go)
+internal/cpf/                        lógica de validação, formatação e geração de CPF
+Dockerfile                           build multi-stage da imagem (distroless)
+.github/workflows/ci-cd.yml          pipeline de CI/CD (GitHub Actions)
+.github/workflows/auto-pr-feature.yml    abre PR feature/* -> develop automaticamente
+.github/workflows/auto-release.yml       develop mergeada -> cria release/X.X.X -> abre PR -> main
+PIPELINE.md                          documentação da pipeline e da automação
 ```
 
 A lógica de negócio (`internal/cpf`) é composta só de funções puras, sem
