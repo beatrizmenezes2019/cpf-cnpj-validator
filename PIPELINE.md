@@ -230,3 +230,16 @@ docker push ghcr.io/<owner>/<repo>:latest
 - **Dinâmica:** `go test -race` (testes unitários com detecção de *race
   conditions*), quality gate de cobertura de testes, smoke test do binário
   compilado rodando de fato em development e homologação.
+
+### Exemplo real: o Trivy barrando o pipeline
+
+Numa das execuções, o Trivy bloqueou o job `build` com 19 CVEs `HIGH` — não
+no código do `docval`, mas na própria *standard library* do Go embutida no
+binário (`net/url`, `crypto/x509`, `crypto/tls`, etc.), porque o
+`Dockerfile` compilava com a última patch da série Go 1.24 (1.24.13), que
+já não recebe mais backports de segurança. A correção foi trocar a versão
+do Go usada no build (`go.mod` e `Dockerfile`) para 1.26.6+, onde essas
+CVEs já estão corrigidas — reforçando por que o scanner de vulnerabilidade
+roda **depois** do build e **antes** de qualquer deploy: ele barra não só
+falhas no código escrito pela equipe, mas também dependências e toolchains
+desatualizados.
