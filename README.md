@@ -32,13 +32,13 @@ go build -o docval ./cmd/docval
 ## Estrutura
 
 ```
-cmd/docval/                          ponto de entrada da CLI (main.go)
-internal/cpf/                        lógica de validação, formatação e geração de CPF
-Dockerfile                           build multi-stage da imagem (distroless)
-.github/workflows/ci-cd.yml          pipeline de CI/CD (GitHub Actions)
-.github/workflows/auto-pr-feature.yml    abre PR feature/* -> develop automaticamente
-.github/workflows/auto-release.yml       develop mergeada -> cria release/X.X.X -> abre PR -> main
-PIPELINE.md                          documentação da pipeline e da automação
+cmd/docval/                 ponto de entrada da CLI (main.go)
+internal/cpf/               lógica de validação, formatação e geração de CPF
+Dockerfile                  build multi-stage da imagem (distroless)
+.github/workflows/ci-cd.yml pipeline de CI/CD completa: verificação, build,
+                             deploy em 3 ambientes e abertura automática de
+                             PR/release (GitHub Actions)
+PIPELINE.md                 documentação da pipeline e da automação
 ```
 
 A lógica de negócio (`internal/cpf`) é composta só de funções puras, sem

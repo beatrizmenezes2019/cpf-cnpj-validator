@@ -15,6 +15,7 @@ name: CI/CD Pipeline - docval
 on:
   push:
     branches:
+      - "feature/**"
       - develop
       - main
       - "release/**"
@@ -28,6 +29,7 @@ permissions:
   contents: write
   packages: write
   security-events: write
+  pull-requests: write
 
 env:
   REGISTRY: ghcr.io
@@ -64,10 +66,14 @@ jobs:
       - name: go vet (análise estática nativa)
         run: go vet ./...
 
+      # Pinado explicitamente na v7 da action + v2.x do golangci-lint:
+      # a v6 da action instala por padrão o golangci-lint 1.x, cujo
+      # schema de configuração é incompatível com o .golangci.yml
+      # (formato v2, com a chave "version: 2" no topo do arquivo).
       - name: golangci-lint (SAST — múltiplos linters agregados)
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.5.0
           args: --timeout=5m
 
       - name: Gitleaks (varredura de segredos/credenciais no código)
@@ -213,15 +219,16 @@ jobs:
       - name: Configurar Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Em Pull Requests a imagem é apenas construída e escaneada
-      # localmente (load), sem publicar no registry: só push direto em
-      # develop/release/main avança para os estágios de deploy.
+      # Só publica no registry quando o push é em develop/release/main —
+      # os três ambientes reais do pipeline. PRs e branches "feature/**"
+      # apenas constroem e escaneiam a imagem localmente (load), já que
+      # não há deploy correspondente para elas.
       - name: Build & push da imagem (tag = commit SHA)
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
+          push: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
+          load: ${{ !(github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
           build-args: |
             VERSION=${{ steps.vars.outputs.version }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
@@ -367,3 +374,127 @@ jobs:
           tag_name: ${{ needs.build.outputs.version }}
           files: dist/*
           generate_release_notes: true
+
+  # ---------------------------------------------------------------------
+  # Estágio 5a — Automação: feature/** -> abre PR para develop.
+  #
+  # É o ÚLTIMO job da cadeia de validação (needs: [build]), então só roda
+  # se static-analysis, codeql, test e build tiverem passado. Um push que
+  # falha em qualquer verificação nunca chega a abrir PR.
+  # ---------------------------------------------------------------------
+  auto-pr-feature:
+    name: "5a. Auto PR (feature -> develop)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feature/')
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Garantir referência local de develop
+        run: git fetch origin develop:refs/remotes/origin/develop
+
+      - name: Criar PR para develop (se ainda não existir)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Secret GH_PAT não configurado. Veja PIPELINE.md > Configuração da automação."
+            exit 1
+          fi
+
+          COMMITS_NOVOS=$(git rev-list --count "origin/develop..HEAD" || echo 0)
+          if [ "$COMMITS_NOVOS" -eq 0 ]; then
+            echo "Nenhum commit novo em '$BRANCH' em relação a develop. Nada a fazer."
+            exit 0
+          fi
+
+          PR_EXISTENTE=$(gh pr list --base develop --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$PR_EXISTENTE" ]; then
+            echo "PR #$PR_EXISTENTE já existe para '$BRANCH' -> develop. Nada a fazer."
+            exit 0
+          fi
+
+          CORPO="Pull Request aberto automaticamente após validação bem-sucedida (lint, testes, build) de \`$BRANCH\`.
+
+          Assim que aprovado e mergeado em \`develop\`, uma branch \`release/X.X.X\` é criada automaticamente e um novo PR para \`main\` é aberto."
+
+          gh pr create \
+            --base develop \
+            --head "$BRANCH" \
+            --title "feat: ${BRANCH#feature/}" \
+            --body "$CORPO"
+
+  # ---------------------------------------------------------------------
+  # Estágio 5b — Automação: push em develop -> cria release/X.X.X -> abre
+  # PR para main.
+  #
+  # Também é o ÚLTIMO job da cadeia (needs: [build]): só cria a branch de
+  # release e o PR de homologação se a validação e o build da develop
+  # tiverem passado. O push da nova branch usa o secret GH_PAT (não o
+  # GITHUB_TOKEN padrão) para que o próprio push dispare este workflow
+  # sobre "release/X.X.X" — veja PIPELINE.md > Configuração da automação.
+  # ---------------------------------------------------------------------
+  auto-release:
+    name: "5b. Auto Release (develop -> release/X.X.X -> main)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    steps:
+      - name: Checkout de develop
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Calcular a próxima versão (semver, bump de patch)
+        id: versao
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::Secret GH_PAT não configurado. Veja PIPELINE.md > Configuração da automação."
+            exit 1
+          fi
+
+          git fetch origin 'refs/heads/release/*:refs/remotes/origin/release/*' --quiet || true
+
+          ULTIMA=$(git branch -r \
+            | grep -oE 'origin/release/[0-9]+\.[0-9]+\.[0-9]+' \
+            | sed 's#origin/release/##' \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -1)
+
+          if [ -z "$ULTIMA" ]; then
+            NOVA="0.1.0"
+          else
+            IFS='.' read -r MA MI PA <<< "$ULTIMA"
+            NOVA="${MA}.${MI}.$((PA + 1))"
+          fi
+
+          echo "Última versão de release encontrada: ${ULTIMA:-nenhuma}"
+          echo "Nova versão: $NOVA"
+          echo "versao=$NOVA" >> "$GITHUB_OUTPUT"
+
+      - name: Criar branch release/<versão> a partir de develop
+        run: |
+          git checkout -b "release/${{ steps.versao.outputs.versao }}"
+          git push origin "release/${{ steps.versao.outputs.versao }}"
+
+      - name: Abrir PR release/<versão> -> main
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          CORPO="Pull Request de homologação aberto automaticamente após validação bem-sucedida (lint, testes, build) do commit ${{ github.sha }} em \`develop\`.
+
+          A branch \`release/${{ steps.versao.outputs.versao }}\` já está publicada e o deploy em **homologação** foi disparado pelo pipeline. Após validar, faça o merge deste PR para liberar em **produção**."
+
+          gh pr create \
+            --base main \
+            --head "release/${{ steps.versao.outputs.versao }}" \
+            --title "release: v${{ steps.versao.outputs.versao }}" \
+            --body "$CORPO"
