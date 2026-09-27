@@ -24,8 +24,8 @@ func capture(t *testing.T, args []string) (stdout, stderr string, code int) {
 
 	code = run(args, outW, errW)
 
-	outW.Close()
-	errW.Close()
+	_ = outW.Close()
+	_ = errW.Close()
 
 	outBytes, _ := io.ReadAll(outR)
 	errBytes, _ := io.ReadAll(errR)

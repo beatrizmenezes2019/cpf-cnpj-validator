@@ -92,6 +92,6 @@ func TestGenerate(t *testing.T) {
 
 func BenchmarkValidate(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		Validate("111.444.777-35")
+		_ = Validate("111.444.777-35")
 	}
 }
