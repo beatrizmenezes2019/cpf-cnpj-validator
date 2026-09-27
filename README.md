@@ -60,3 +60,4 @@ uma pipeline de CI/CD:
 ```bash
 go build -ldflags "-X main.version=v1.0.0" -o docval ./cmd/docval
 ```
+
