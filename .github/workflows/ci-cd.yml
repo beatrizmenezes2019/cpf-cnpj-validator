@@ -45,8 +45,15 @@ jobs:
     name: "1. Verificação estática (lint, vet, segredos)"
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 (histórico completo) é necessário aqui porque o
+      # Gitleaks (último passo deste job) varre um intervalo de commits
+      # (base..head do PR) — com o checkout raso padrão (profundidade 1)
+      # ele falha com "unknown revision or path not in the working tree",
+      # pois o commit-base do PR não está presente localmente.
       - name: Checkout do código
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Usa a versão MÍNIMA declarada em go.mod (1.24.7) de propósito.
       # O go.mod é mantido baixo aqui porque o golangci-lint 2.5.0 (ver
